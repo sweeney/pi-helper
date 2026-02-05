@@ -3,12 +3,14 @@ package network
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
 
 // MockNetlinkProvider implements NetlinkProvider for testing.
 type MockNetlinkProvider struct {
+	mu     sync.RWMutex
 	links  []LinkInfo
 	addrs  map[int][]AddrInfo
 	routes []RouteInfo
@@ -33,6 +35,8 @@ func NewMockNetlinkProvider() *MockNetlinkProvider {
 }
 
 func (m *MockNetlinkProvider) Links() ([]LinkInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.linksErr != nil {
 		return nil, m.linksErr
 	}
@@ -40,6 +44,8 @@ func (m *MockNetlinkProvider) Links() ([]LinkInfo, error) {
 }
 
 func (m *MockNetlinkProvider) Addrs(linkIndex int) ([]AddrInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.addrsErr != nil {
 		return nil, m.addrsErr
 	}
@@ -47,6 +53,8 @@ func (m *MockNetlinkProvider) Addrs(linkIndex int) ([]AddrInfo, error) {
 }
 
 func (m *MockNetlinkProvider) Routes() ([]RouteInfo, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.routesErr != nil {
 		return nil, m.routesErr
 	}
@@ -59,6 +67,15 @@ func (m *MockNetlinkProvider) Subscribe() (<-chan LinkInfo, <-chan AddrInfo, <-c
 	}
 	done := make(chan struct{})
 	return m.linkCh, m.addrCh, m.routeCh, done, nil
+}
+
+// SetState safely sets the mock state (for use during tests with running monitors).
+func (m *MockNetlinkProvider) SetState(links []LinkInfo, addrs map[int][]AddrInfo, routes []RouteInfo) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.links = links
+	m.addrs = addrs
+	m.routes = routes
 }
 
 func TestMonitor_State_Disconnected(t *testing.T) {
@@ -190,9 +207,11 @@ func TestMonitor_State_NoWifiHardware(t *testing.T) {
 
 func TestMonitor_Subscribe(t *testing.T) {
 	mock := NewMockNetlinkProvider()
-	mock.links = []LinkInfo{
-		{Name: "lo", Index: 1, Up: true, Running: true},
-	}
+	mock.SetState(
+		[]LinkInfo{{Name: "lo", Index: 1, Up: true, Running: true}},
+		make(map[int][]AddrInfo),
+		nil,
+	)
 
 	m := NewMonitor(WithNetlinkProvider(mock), WithPollInterval(50*time.Millisecond))
 
@@ -209,17 +228,19 @@ func TestMonitor_Subscribe(t *testing.T) {
 	// Wait a bit for initial poll to complete, then update mock
 	time.Sleep(10 * time.Millisecond)
 
-	// Update mock to simulate network coming up
-	mock.links = []LinkInfo{
-		{Name: "lo", Index: 1, Up: true, Running: true},
-		{Name: "eth0", Index: 2, Up: true, Running: true},
-	}
-	mock.addrs = map[int][]AddrInfo{
-		2: {{LinkIndex: 2, IP: net.ParseIP("192.168.1.50"), Mask: net.CIDRMask(24, 32)}},
-	}
-	mock.routes = []RouteInfo{
-		{LinkIndex: 2, Dst: nil, Gateway: net.ParseIP("192.168.1.1")},
-	}
+	// Update mock to simulate network coming up (thread-safe)
+	mock.SetState(
+		[]LinkInfo{
+			{Name: "lo", Index: 1, Up: true, Running: true},
+			{Name: "eth0", Index: 2, Up: true, Running: true},
+		},
+		map[int][]AddrInfo{
+			2: {{LinkIndex: 2, IP: net.ParseIP("192.168.1.50"), Mask: net.CIDRMask(24, 32)}},
+		},
+		[]RouteInfo{
+			{LinkIndex: 2, Dst: nil, Gateway: net.ParseIP("192.168.1.1")},
+		},
+	)
 
 	// Wait for state change notification - may receive disconnected first, wait for connected
 	timeout := time.After(500 * time.Millisecond)
