@@ -35,15 +35,18 @@ jobs:
             exit 1
           fi
 
-      - name: Run tests with JSON output
+      - name: Run tests
         run: |
-          set -o pipefail
-          go test -v -race -coverprofile=coverage.out -json ./... 2>&1 | tee test-results.json || echo "TEST_FAILED=true" >> $GITHUB_ENV
+          go test -v -race -coverprofile=coverage.out ./... 2>&1 | tee test-output.txt
+          echo "TEST_EXIT_CODE=${PIPESTATUS[0]}" >> $GITHUB_ENV
 
-      - name: Generate HTML coverage report
+      - name: Generate coverage report
+        if: always()
         run: |
-          go tool cover -html=coverage.out -o coverage.html
-          go tool cover -func=coverage.out > coverage.txt
+          if [ -f coverage.out ]; then
+            go tool cover -html=coverage.out -o coverage.html
+            go tool cover -func=coverage.out > coverage.txt
+          fi
 
       - name: Generate test summary
         if: always()
@@ -51,97 +54,52 @@ jobs:
           echo "## 🧪 Test Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Test counts
-          PASSED=$(grep -c '"Action":"pass"' test-results.json 2>/dev/null | head -1 || echo 0)
-          FAILED=$(grep -c '"Action":"fail"' test-results.json 2>/dev/null | head -1 || echo 0)
-          SKIPPED=$(grep -c '"Action":"skip"' test-results.json 2>/dev/null | head -1 || echo 0)
-
-          echo "| ✅ Passed | ❌ Failed | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
-          echo "|:--------:|:--------:|:---------:|" >> $GITHUB_STEP_SUMMARY
-          echo "| $PASSED | $FAILED | $SKIPPED |" >> $GITHUB_STEP_SUMMARY
+          # Check if tests passed
+          if [ "$TEST_EXIT_CODE" = "0" ]; then
+            echo "✅ **All tests passed**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Tests failed**" >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Failed test output
-          if [ "$FAILED" -gt 0 ]; then
-            echo "<details open>" >> $GITHUB_STEP_SUMMARY
-            echo "<summary>❌ Failed Test Output</summary>" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            jq -r 'select(.Action=="output") | select(.Test != null) | .Output // empty' test-results.json 2>/dev/null | head -200 >> $GITHUB_STEP_SUMMARY || true
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "</details>" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-          fi
+          # Show test output
+          echo "<details>" >> $GITHUB_STEP_SUMMARY
+          echo "<summary>📋 Test Output</summary>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat test-output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "</details>" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
 
           # Coverage section
-          echo "## 📊 Coverage Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f coverage.txt ]; then
+            echo "## 📊 Coverage Report" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
 
-          TOTAL=$(go tool cover -func=coverage.out | grep total | awk '{print $3}')
-          echo "**Overall Coverage: $TOTAL**" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+            TOTAL=$(grep total coverage.txt | awk '{print $3}')
+            echo "**Overall Coverage: $TOTAL**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
 
-          # Coverage by package
-          echo "### Coverage by Package" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          for pkg in internal/daemon internal/envwriter internal/network; do
-            if go test -coverprofile=tmp.out ./$pkg/ 2>/dev/null; then
-              COV=$(go tool cover -func=tmp.out | grep total | awk '{print $3}' | tr -d '%')
-              if [ -n "$COV" ]; then
-                FILLED=$(echo "$COV / 10" | bc)
-                EMPTY=$((10 - FILLED))
-                BAR=""
-                for i in $(seq 1 $FILLED 2>/dev/null); do BAR+="█"; done
-                for i in $(seq 1 $EMPTY 2>/dev/null); do BAR+="░"; done
-                printf "%-20s %s %5.1f%%\n" "$pkg" "$BAR" "$COV" >> $GITHUB_STEP_SUMMARY
-              fi
-            fi
-          done
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Uncovered functions
-          UNCOVERED=$(go tool cover -func=coverage.out | grep -v "100.0%" | grep -v "total:" || true)
-          if [ -n "$UNCOVERED" ]; then
+            # Full function coverage
             echo "<details>" >> $GITHUB_STEP_SUMMARY
-            echo "<summary>⚠️ Functions Below 100% Coverage</summary>" >> $GITHUB_STEP_SUMMARY
+            echo "<summary>📋 Coverage by Function</summary>" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            echo "$UNCOVERED" >> $GITHUB_STEP_SUMMARY
+            cat coverage.txt >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
             echo "</details>" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
-          # Full function coverage
-          echo "<details>" >> $GITHUB_STEP_SUMMARY
-          echo "<summary>📋 Full Function Coverage</summary>" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          go tool cover -func=coverage.out >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "</details>" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-
-          # Slowest tests
-          echo "<details>" >> $GITHUB_STEP_SUMMARY
-          echo "<summary>🐢 Slowest Tests (top 10)</summary>" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Test | Duration |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|----------|" >> $GITHUB_STEP_SUMMARY
-          jq -r 'select(.Action=="pass" and .Test != null and .Elapsed != null) | "\(.Package | split("/") | .[-1])/\(.Test)|\(.Elapsed)s"' test-results.json 2>/dev/null | \
-            sort -t'|' -k2 -rn | head -10 | \
-            while IFS='|' read test dur; do
-              echo "| \`$test\` | $dur |" >> $GITHUB_STEP_SUMMARY
-            done || true
-          echo "</details>" >> $GITHUB_STEP_SUMMARY
-
-      - name: Fail if tests failed
-        if: env.TEST_FAILED == 'true'
-        run: exit 1
+      - name: Check test result
+        if: always()
+        run: |
+          if [ "$TEST_EXIT_CODE" != "0" ]; then
+            exit 1
+          fi
 
       - name: Upload coverage report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
@@ -149,6 +107,7 @@ jobs:
             coverage.html
             coverage.txt
           retention-days: 30
+          if-no-files-found: ignore
 
   build:
     runs-on: ubuntu-latest
