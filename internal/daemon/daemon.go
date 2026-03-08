@@ -11,6 +11,7 @@ import (
 
 	"github.com/sweeney/pi-helper/internal/envwriter"
 	"github.com/sweeney/pi-helper/internal/network"
+	"github.com/sweeney/pi-helper/internal/wifi"
 )
 
 // Config holds daemon configuration.
@@ -69,6 +70,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Write initial state
 	d.writeState(d.monitor.State())
 
+	d.applyWifiConfig()
+
 	d.logger.Printf("daemon running, press Ctrl+C to stop")
 
 	// Main loop: wait for state changes or shutdown
@@ -85,6 +88,33 @@ func (d *Daemon) Run(ctx context.Context) error {
 				return nil
 			}
 			d.writeState(state)
+		}
+	}
+}
+
+// applyWifiConfig disables power save on all wireless interfaces.
+func (d *Daemon) applyWifiConfig() {
+	ifaces, err := wifi.WirelessInterfaces()
+	if err != nil {
+		d.logger.Printf("wifi: failed to list wireless interfaces: %v", err)
+		return
+	}
+	for _, iface := range ifaces {
+		d.logger.Printf("wifi: %s: disabling power save...", iface)
+
+		on, err := wifi.PowerSaveEnabled(iface)
+		if err != nil {
+			d.logger.Printf("wifi: %s: could not read power save state: %v", iface, err)
+			continue
+		}
+		if !on {
+			d.logger.Printf("wifi: %s: already off", iface)
+			continue
+		}
+		if err := wifi.DisablePowerSave(iface); err != nil {
+			d.logger.Printf("wifi: %s: error: %v", iface, err)
+		} else {
+			d.logger.Printf("wifi: %s: done", iface)
 		}
 	}
 }

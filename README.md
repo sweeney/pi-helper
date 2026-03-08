@@ -195,7 +195,8 @@ pi-helper/
 ├── internal/
 │   ├── daemon/              # Main daemon loop
 │   ├── envwriter/           # Atomic file writing
-│   └── network/             # Network monitoring (netlink + polling)
+│   ├── network/             # Network monitoring (netlink + polling)
+│   └── wifi/                # WiFi power save management
 ├── pkg/testutil/            # Shared test mocks
 ├── Makefile
 ├── setup.sh                 # Pi setup script
@@ -220,6 +221,47 @@ go test -race ./...     # With race detector
 3. **Atomic Writes**: When state changes, pi-helper writes to a temporary file then atomically renames it to `/run/pi-helper.env`, ensuring readers never see partial writes.
 
 4. **Interface Detection**: Determines interface type by name pattern (`wlan*` = wifi, `eth*`/`enp*` = ethernet) and finds the primary interface by checking which has the default route.
+
+5. **WiFi Power Save**: At startup, pi-helper disables WiFi power management on all wireless interfaces (see below).
+
+## WiFi Power Management
+
+### Problem
+
+The Linux kernel's WiFi power save mode allows the wireless driver to sleep the radio aggressively to save power. On a Pi Zero W this can cause:
+
+- MQTT connections dropping silently (the broker times out the client while the radio is asleep)
+- The Pi eventually losing network association entirely and becoming unreachable
+- No kernel log warnings — from the OS's perspective the interface is still "up"
+
+This is a known issue with the `brcmfmac` driver used by the Pi Zero W's onboard WiFi chip. It is particularly bad for always-on IoT devices that hold long-lived TCP connections.
+
+### Solution
+
+At startup, pi-helper runs `iw dev <iface> set power_save off` on every wireless interface it finds. This instructs the driver to keep the radio active, trading a small amount of power consumption for a stable connection.
+
+### How it works
+
+The `internal/wifi` package provides two functions:
+
+- **`WirelessInterfaces()`** — reads `/sys/class/net` and checks for a `wireless` subdirectory, which the kernel creates for every wireless interface. This is authoritative and requires no external commands.
+- **`DisablePowerSave(iface)`** — runs `iw dev <iface> set power_save off`.
+
+`applyWifiConfig()` is called once in the daemon's `Run()` loop, just after writing the initial network state. Failures are logged but do not crash the daemon — if `iw` is absent or the interface doesn't support the setting, pi-helper continues normally.
+
+### Verifying on the device
+
+```bash
+# Check the daemon applied the setting at last boot
+journalctl -u pi-helper --no-pager | grep wifi
+# Expected: wifi: disabled power save on wlan0
+
+# Confirm it is currently off
+sudo iw dev wlan0 get power_save
+# Expected: Power save: off
+```
+
+Note: this setting is applied at runtime, not persisted in firmware. It is re-applied every time pi-helper starts, so it survives reboots as long as pi-helper is enabled as a systemd service.
 
 ## Project Statistics
 
