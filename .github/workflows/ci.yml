@@ -20,6 +20,9 @@ jobs:
       - name: Verify dependencies
         run: go mod verify
 
+      - name: Download dependencies
+        run: go mod download
+
       - name: Run go vet
         run: |
           VET_OUTPUT=$(go vet ./... 2>&1) || true
