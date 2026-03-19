@@ -142,19 +142,28 @@ func (m *Monitor) eventLoop(ctx context.Context, linkCh <-chan LinkInfo, addrCh 
 			return
 		case <-m.done:
 			return
-		case _, ok := <-linkCh:
+		case link, ok := <-linkCh:
 			if !ok {
 				return
+			}
+			if m.verbose {
+				m.logger.Printf("netlink: link event: %s (up=%v running=%v)", link.Name, link.Up, link.Running)
 			}
 			m.poll()
 		case _, ok := <-addrCh:
 			if !ok {
 				return
 			}
+			if m.verbose {
+				m.logger.Printf("netlink: address event")
+			}
 			m.poll()
 		case _, ok := <-routeCh:
 			if !ok {
 				return
+			}
+			if m.verbose {
+				m.logger.Printf("netlink: route event")
 			}
 			m.poll()
 		}
@@ -186,14 +195,19 @@ func (m *Monitor) poll() {
 
 	m.mu.Lock()
 	changed := !m.state.Equal(newState)
+	oldState := m.state
 	if changed {
 		m.state = newState
-		if m.verbose {
-			m.logger.Printf("state changed: status=%s type=%s ip=%s", newState.Status, newState.Type, newState.IP)
-		}
 	}
 	subscribers := m.subscribers
 	m.mu.Unlock()
+
+	if changed {
+		m.logger.Printf("state changed: %s/%s → %s/%s (wifi: %s → %s, ip: %s → %s)",
+			oldState.Status, oldState.Type, newState.Status, newState.Type,
+			oldState.WifiStatus, newState.WifiStatus,
+			oldState.IP, newState.IP)
+	}
 
 	if changed {
 		for _, ch := range subscribers {
