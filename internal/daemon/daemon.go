@@ -18,12 +18,14 @@ import (
 
 // Config holds daemon configuration.
 type Config struct {
-	EnvFilePath       string
-	PollInterval      time.Duration
-	Verbose           bool
-	WifiRecoveryDelay time.Duration              // Grace period before wifi recovery nudge (0 disables)
-	RecoveryFunc      func(context.Context) error // Called to recover wifi; nil uses default nmcli
-	NMFuncs           *NMFuncs                    // NM operations; nil uses real nmcli
+	EnvFilePath          string
+	PollInterval         time.Duration
+	Verbose              bool
+	WifiRecoveryDelay    time.Duration              // Grace period before wifi recovery nudge (0 disables)
+	RecoveryFunc         func(context.Context) error // Called to recover wifi; nil uses default nmcli
+	NMFuncs              *NMFuncs                    // NM operations; nil uses real nmcli
+	InternetCheckInterval time.Duration              // Interval between internet checks (0 disables)
+	InternetCheckURL     string                      // URL to check; empty uses default
 }
 
 // NMFuncs allows injecting NetworkManager operations for testing.
@@ -36,33 +38,47 @@ type NMFuncs struct {
 // DefaultConfig returns the default daemon configuration.
 func DefaultConfig() Config {
 	return Config{
-		EnvFilePath:       "/run/pi-helper.env",
-		PollInterval:      30 * time.Second,
-		Verbose:           false,
-		WifiRecoveryDelay: 60 * time.Second,
+		EnvFilePath:           "/run/pi-helper.env",
+		PollInterval:          30 * time.Second,
+		Verbose:               false,
+		WifiRecoveryDelay:     60 * time.Second,
+		InternetCheckInterval: 5 * time.Minute,
 	}
 }
 
 // Daemon coordinates the pi-helper components.
 type Daemon struct {
-	config           Config
-	logger           *log.Logger
-	monitor          *network.Monitor
-	writer           *envwriter.FileWriter
-	lastState        network.State
-	lastWifiStatus   string
+	config            Config
+	logger            *log.Logger
+	monitor           *network.Monitor
+	writer            *envwriter.FileWriter
+	lastState         network.State
+	lastWifiStatus    string
 	wifiRecoveryTimer *time.Timer
+	internetChecker   *network.InternetChecker
 }
 
 // New creates a new Daemon with the given configuration.
 func New(config Config) *Daemon {
 	logger := log.New(os.Stderr, "[pi-helper] ", log.LstdFlags)
 
+	var checker *network.InternetChecker
+	if config.InternetCheckInterval > 0 {
+		var opts []network.InternetCheckerOption
+		opts = append(opts, network.WithInternetCheckInterval(config.InternetCheckInterval))
+		opts = append(opts, network.WithInternetCheckVerbose(config.Verbose))
+		if config.InternetCheckURL != "" {
+			opts = append(opts, network.WithInternetCheckURL(config.InternetCheckURL))
+		}
+		checker = network.NewInternetChecker(opts...)
+	}
+
 	return &Daemon{
-		config:  config,
-		logger:  logger,
-		monitor: network.NewMonitor(network.WithPollInterval(config.PollInterval), network.WithVerbose(config.Verbose)),
-		writer:  envwriter.New(config.EnvFilePath),
+		config:          config,
+		logger:          logger,
+		monitor:         network.NewMonitor(network.WithPollInterval(config.PollInterval), network.WithVerbose(config.Verbose)),
+		writer:          envwriter.New(config.EnvFilePath),
+		internetChecker: checker,
 	}
 }
 
@@ -89,6 +105,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.writeState(d.lastState)
 
 	d.applyWifiConfig()
+
+	// Start internet checker if enabled
+	var internetCh <-chan string
+	if d.internetChecker != nil {
+		ch := make(chan string, 1)
+		internetCh = ch
+		go d.internetChecker.Run(ctx, ch)
+		d.logger.Printf("internet check enabled every %v", d.config.InternetCheckInterval)
+	}
 
 	d.logger.Printf("daemon running, press Ctrl+C to stop")
 
@@ -117,6 +142,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-recoveryCh:
 			recoveryCh = nil
 			d.attemptWifiRecovery(ctx)
+
+		case status, ok := <-internetCh:
+			if !ok {
+				internetCh = nil
+				continue
+			}
+			d.handleInternetStatus(status)
 		}
 	}
 }
@@ -149,6 +181,9 @@ func (d *Daemon) logStateTransition(newState network.State) {
 	}
 	if old.Type != newState.Type {
 		parts = append(parts, fmt.Sprintf("type: %s → %s", old.Type, newState.Type))
+	}
+	if old.InternetStatus != newState.InternetStatus {
+		parts = append(parts, fmt.Sprintf("internet: %s → %s", old.InternetStatus, newState.InternetStatus))
 	}
 
 	if len(parts) > 0 {
@@ -297,6 +332,16 @@ func (d *Daemon) ensureInfiniteAutoconnectRetries() {
 			d.logger.Printf("wifi: %s: autoconnect-retries set to infinite", conn)
 		}
 	}
+}
+
+// handleInternetStatus updates the state with the latest internet check result.
+func (d *Daemon) handleInternetStatus(status string) {
+	if d.lastState.InternetStatus == status {
+		return
+	}
+	d.logger.Printf("internet: %s → %s", d.lastState.InternetStatus, status)
+	d.lastState.InternetStatus = status
+	d.writeState(d.lastState)
 }
 
 // writeState writes the current network state to the env file.

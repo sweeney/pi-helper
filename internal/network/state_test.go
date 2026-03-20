@@ -16,6 +16,9 @@ func TestNewState(t *testing.T) {
 	if state.WifiStatus != WifiStatusDisconnected {
 		t.Errorf("NewState().WifiStatus = %q, want %q", state.WifiStatus, WifiStatusDisconnected)
 	}
+	if state.InternetStatus != InternetStatusUnknown {
+		t.Errorf("NewState().InternetStatus = %q, want %q", state.InternetStatus, InternetStatusUnknown)
+	}
 }
 
 func TestState_IsConnected(t *testing.T) {
@@ -94,12 +97,13 @@ func TestState_ToEnvVars(t *testing.T) {
 	vars := state.ToEnvVars()
 
 	expected := map[string]string{
-		"NETWORK_STATUS":      "connected",
-		"NETWORK_TYPE":        "wifi",
-		"NETWORK_IP":          "192.168.1.100",
-		"NETWORK_GATEWAY":     "192.168.1.1",
-		"NETWORK_WIFI_STATUS": "connected",
-		"NETWORK_WIFI_SSID":   "MyNetwork",
+		"NETWORK_STATUS":          "connected",
+		"NETWORK_TYPE":            "wifi",
+		"NETWORK_IP":              "192.168.1.100",
+		"NETWORK_GATEWAY":         "192.168.1.1",
+		"NETWORK_WIFI_STATUS":     "connected",
+		"NETWORK_WIFI_SSID":       "MyNetwork",
+		"NETWORK_INTERNET_STATUS": "",
 	}
 
 	for k, want := range expected {

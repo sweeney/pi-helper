@@ -22,22 +22,31 @@ const (
 	WifiStatusNoHardware  = "no-hardware"
 )
 
+// Internet status constants.
+const (
+	InternetStatusOK      = "ok"
+	InternetStatusOffline = "offline"
+	InternetStatusUnknown = "unknown"
+)
+
 // State represents the current network state.
 type State struct {
-	Status     string // "connected", "disconnected", "connecting"
-	Type       string // "wifi", "ethernet", ""
-	IP         string
-	Gateway    string
-	WifiStatus string // "connected", "disconnected", "no-hardware"
-	WifiSSID   string
+	Status         string // "connected", "disconnected", "connecting"
+	Type           string // "wifi", "ethernet", ""
+	IP             string
+	Gateway        string
+	WifiStatus     string // "connected", "disconnected", "no-hardware"
+	WifiSSID       string
+	InternetStatus string // "ok", "offline", "unknown"
 }
 
 // NewState creates a new State with default disconnected values.
 func NewState() State {
 	return State{
-		Status:     StatusDisconnected,
-		Type:       TypeNone,
-		WifiStatus: WifiStatusDisconnected,
+		Status:         StatusDisconnected,
+		Type:           TypeNone,
+		WifiStatus:     WifiStatusDisconnected,
+		InternetStatus: InternetStatusUnknown,
 	}
 }
 
@@ -59,12 +68,13 @@ func (s State) IsEthernet() bool {
 // ToEnvVars converts the state to environment variable key-value pairs.
 func (s State) ToEnvVars() map[string]string {
 	return map[string]string{
-		"NETWORK_STATUS":      s.Status,
-		"NETWORK_TYPE":        s.Type,
-		"NETWORK_IP":          s.IP,
-		"NETWORK_GATEWAY":     s.Gateway,
-		"NETWORK_WIFI_STATUS": s.WifiStatus,
-		"NETWORK_WIFI_SSID":   s.WifiSSID,
+		"NETWORK_STATUS":          s.Status,
+		"NETWORK_TYPE":            s.Type,
+		"NETWORK_IP":              s.IP,
+		"NETWORK_GATEWAY":         s.Gateway,
+		"NETWORK_WIFI_STATUS":     s.WifiStatus,
+		"NETWORK_WIFI_SSID":       s.WifiSSID,
+		"NETWORK_INTERNET_STATUS": s.InternetStatus,
 	}
 }
 
@@ -75,5 +85,6 @@ func (s State) Equal(other State) bool {
 		s.IP == other.IP &&
 		s.Gateway == other.Gateway &&
 		s.WifiStatus == other.WifiStatus &&
-		s.WifiSSID == other.WifiSSID
+		s.WifiSSID == other.WifiSSID &&
+		s.InternetStatus == other.InternetStatus
 }
