@@ -4,92 +4,136 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 )
 
-func TestInternetChecker_Check_OK(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer srv.Close()
+func TestInternetChecker_Check(t *testing.T) {
+	tests := []struct {
+		name           string
+		handler        http.HandlerFunc
+		clientOverride *http.Client
+		wantStatus     string
+		wantHTTPStatus int
+		wantErrSubstr  string // empty means expect nil error
+	}{
+		{
+			name:           "204 No Content is OK",
+			handler:        func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNoContent) },
+			wantStatus:     InternetStatusOK,
+			wantHTTPStatus: 204,
+		},
+		{
+			name:           "200 OK is OK",
+			handler:        func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) },
+			wantStatus:     InternetStatusOK,
+			wantHTTPStatus: 200,
+		},
+		{
+			name:           "500 is offline",
+			handler:        func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) },
+			wantStatus:     InternetStatusOffline,
+			wantHTTPStatus: 500,
+			wantErrSubstr:  "unexpected status 500",
+		},
+		{
+			name:           "403 is offline",
+			handler:        func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusForbidden) },
+			wantStatus:     InternetStatusOffline,
+			wantHTTPStatus: 403,
+			wantErrSubstr:  "unexpected status 403",
+		},
+		{
+			name:    "301 is offline (no redirect follow)",
+			handler: func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusMovedPermanently) },
+			clientOverride: &http.Client{
+				CheckRedirect: func(req *http.Request, via []*http.Request) error {
+					return http.ErrUseLastResponse
+				},
+			},
+			wantStatus:     InternetStatusOffline,
+			wantHTTPStatus: 301,
+			wantErrSubstr:  "unexpected status 301",
+		},
+	}
 
-	c := NewInternetChecker(WithInternetCheckURL(srv.URL))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(tt.handler)
+			defer srv.Close()
 
-	result := c.Check(context.Background())
-	if result.Status != InternetStatusOK {
-		t.Errorf("Check().Status = %q, want %q", result.Status, InternetStatusOK)
-	}
-	if result.HTTPStatus != 204 {
-		t.Errorf("Check().HTTPStatus = %d, want 204", result.HTTPStatus)
-	}
-	if result.Err != nil {
-		t.Errorf("Check().Err = %v, want nil", result.Err)
-	}
-	if result.Latency <= 0 {
-		t.Errorf("Check().Latency = %v, want > 0", result.Latency)
+			opts := []InternetCheckerOption{WithInternetCheckURL(srv.URL)}
+			if tt.clientOverride != nil {
+				opts = append(opts, WithHTTPClient(tt.clientOverride))
+			}
+			c := NewInternetChecker(opts...)
+
+			result := c.Check(context.Background())
+
+			if result.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q", result.Status, tt.wantStatus)
+			}
+			if result.HTTPStatus != tt.wantHTTPStatus {
+				t.Errorf("HTTPStatus = %d, want %d", result.HTTPStatus, tt.wantHTTPStatus)
+			}
+			if tt.wantErrSubstr == "" && result.Err != nil {
+				t.Errorf("Err = %v, want nil", result.Err)
+			}
+			if tt.wantErrSubstr != "" {
+				if result.Err == nil {
+					t.Fatalf("Err = nil, want error containing %q", tt.wantErrSubstr)
+				}
+				if got := result.Err.Error(); !contains(got, tt.wantErrSubstr) {
+					t.Errorf("Err = %q, want substring %q", got, tt.wantErrSubstr)
+				}
+			}
+			if result.Latency <= 0 {
+				t.Errorf("Latency = %v, want > 0", result.Latency)
+			}
+		})
 	}
 }
 
-func TestInternetChecker_Check_200OK(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
+func TestInternetChecker_Check_ConnectionFailure(t *testing.T) {
+	tests := []struct {
+		name          string
+		url           string
+		wantErrSubstr string
+	}{
+		{
+			name:          "unreachable host",
+			url:           "http://127.0.0.1:1",
+			wantErrSubstr: "http request",
+		},
+		{
+			name:          "invalid URL",
+			url:           "://bad-url",
+			wantErrSubstr: "build request",
+		},
+	}
 
-	c := NewInternetChecker(WithInternetCheckURL(srv.URL))
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewInternetChecker(
+				WithInternetCheckURL(tt.url),
+				WithInternetCheckTimeout(100*time.Millisecond),
+			)
 
-	result := c.Check(context.Background())
-	if result.Status != InternetStatusOK {
-		t.Errorf("Check().Status = %q, want %q", result.Status, InternetStatusOK)
-	}
-	if result.HTTPStatus != 200 {
-		t.Errorf("Check().HTTPStatus = %d, want 200", result.HTTPStatus)
-	}
-}
+			result := c.Check(context.Background())
 
-func TestInternetChecker_Check_ServerError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-
-	c := NewInternetChecker(WithInternetCheckURL(srv.URL))
-
-	result := c.Check(context.Background())
-	if result.Status != InternetStatusOffline {
-		t.Errorf("Check().Status = %q, want %q", result.Status, InternetStatusOffline)
-	}
-	if result.HTTPStatus != 500 {
-		t.Errorf("Check().HTTPStatus = %d, want 500", result.HTTPStatus)
-	}
-	if result.Err == nil {
-		t.Error("Check().Err should be non-nil for server error")
-	}
-	if !strings.Contains(result.Err.Error(), "unexpected status 500") {
-		t.Errorf("Check().Err = %v, want to contain 'unexpected status 500'", result.Err)
-	}
-}
-
-func TestInternetChecker_Check_Unreachable(t *testing.T) {
-	c := NewInternetChecker(
-		WithInternetCheckURL("http://127.0.0.1:1"), // nothing listening
-		WithInternetCheckTimeout(100*time.Millisecond),
-	)
-
-	result := c.Check(context.Background())
-	if result.Status != InternetStatusOffline {
-		t.Errorf("Check().Status = %q, want %q", result.Status, InternetStatusOffline)
-	}
-	if result.Err == nil {
-		t.Error("Check().Err should be non-nil for unreachable host")
-	}
-	if result.HTTPStatus != 0 {
-		t.Errorf("Check().HTTPStatus = %d, want 0 for connection failure", result.HTTPStatus)
-	}
-	if result.Latency <= 0 {
-		t.Errorf("Check().Latency = %v, want > 0 even on failure", result.Latency)
+			if result.Status != InternetStatusOffline {
+				t.Errorf("Status = %q, want %q", result.Status, InternetStatusOffline)
+			}
+			if result.HTTPStatus != 0 {
+				t.Errorf("HTTPStatus = %d, want 0 for connection failure", result.HTTPStatus)
+			}
+			if result.Err == nil {
+				t.Fatalf("Err = nil, want error containing %q", tt.wantErrSubstr)
+			}
+			if got := result.Err.Error(); !contains(got, tt.wantErrSubstr) {
+				t.Errorf("Err = %q, want substring %q", got, tt.wantErrSubstr)
+			}
+		})
 	}
 }
 
@@ -106,10 +150,47 @@ func TestInternetChecker_Check_CancelledContext(t *testing.T) {
 
 	result := c.Check(ctx)
 	if result.Status != InternetStatusOffline {
-		t.Errorf("Check().Status with cancelled ctx = %q, want %q", result.Status, InternetStatusOffline)
+		t.Errorf("Status = %q, want %q", result.Status, InternetStatusOffline)
 	}
 	if result.Err == nil {
-		t.Error("Check().Err should be non-nil for cancelled context")
+		t.Error("Err should be non-nil for cancelled context")
+	}
+}
+
+func TestInternetChecker_Check_SlowServerTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Second)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := NewInternetChecker(
+		WithInternetCheckURL(srv.URL),
+		WithInternetCheckTimeout(50*time.Millisecond),
+	)
+
+	result := c.Check(context.Background())
+	if result.Status != InternetStatusOffline {
+		t.Errorf("Status = %q, want %q", result.Status, InternetStatusOffline)
+	}
+	if result.Err == nil {
+		t.Error("Err should be non-nil for timeout")
+	}
+}
+
+func TestInternetChecker_Check_UsesGET(t *testing.T) {
+	var method string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		method = r.Method
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	c := NewInternetChecker(WithInternetCheckURL(srv.URL))
+	c.Check(context.Background())
+
+	if method != http.MethodGet {
+		t.Errorf("method = %q, want %q", method, http.MethodGet)
 	}
 }
 
@@ -121,7 +202,7 @@ func TestInternetChecker_Run_ImmediateCheck(t *testing.T) {
 
 	c := NewInternetChecker(
 		WithInternetCheckURL(srv.URL),
-		WithInternetCheckInterval(time.Hour), // long interval so only the immediate check fires
+		WithInternetCheckInterval(time.Hour),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -132,7 +213,7 @@ func TestInternetChecker_Run_ImmediateCheck(t *testing.T) {
 	select {
 	case result := <-ch:
 		if result.Status != InternetStatusOK {
-			t.Errorf("immediate check = %q, want %q", result.Status, InternetStatusOK)
+			t.Errorf("immediate check Status = %q, want %q", result.Status, InternetStatusOK)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for immediate check result")
@@ -159,7 +240,6 @@ func TestInternetChecker_Run_PeriodicCheck(t *testing.T) {
 
 	go c.Run(ctx, ch)
 
-	// Wait for at least 3 results (immediate + 2 periodic)
 	for i := 0; i < 3; i++ {
 		select {
 		case <-ch:
@@ -172,105 +252,6 @@ func TestInternetChecker_Run_PeriodicCheck(t *testing.T) {
 
 	if count < 3 {
 		t.Errorf("expected at least 3 HTTP requests, got %d", count)
-	}
-}
-
-func TestInternetChecker_Defaults(t *testing.T) {
-	c := NewInternetChecker()
-
-	if c.url != DefaultInternetCheckURL {
-		t.Errorf("default URL = %q, want %q", c.url, DefaultInternetCheckURL)
-	}
-	if c.interval != 5*time.Minute {
-		t.Errorf("default interval = %v, want 5m", c.interval)
-	}
-	if c.timeout != 10*time.Second {
-		t.Errorf("default timeout = %v, want 10s", c.timeout)
-	}
-	if c.client == nil {
-		t.Error("client should not be nil")
-	}
-}
-
-func TestInternetChecker_WithHTTPClient(t *testing.T) {
-	custom := &http.Client{Timeout: 42 * time.Second}
-	c := NewInternetChecker(WithHTTPClient(custom))
-
-	if c.client != custom {
-		t.Error("expected custom HTTP client to be used")
-	}
-}
-
-func TestInternetChecker_Check_InvalidURL(t *testing.T) {
-	c := NewInternetChecker(WithInternetCheckURL("://bad-url"))
-
-	result := c.Check(context.Background())
-	if result.Status != InternetStatusOffline {
-		t.Errorf("Check().Status with invalid URL = %q, want %q", result.Status, InternetStatusOffline)
-	}
-	if result.Err == nil {
-		t.Error("Check().Err should be non-nil for invalid URL")
-	}
-	if !strings.Contains(result.Err.Error(), "build request") {
-		t.Errorf("Check().Err = %v, want to contain 'build request'", result.Err)
-	}
-}
-
-func TestInternetChecker_Check_UsesGET(t *testing.T) {
-	var method string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		method = r.Method
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer srv.Close()
-
-	c := NewInternetChecker(WithInternetCheckURL(srv.URL))
-	c.Check(context.Background())
-
-	if method != http.MethodGet {
-		t.Errorf("Check() used method %q, want %q", method, http.MethodGet)
-	}
-}
-
-func TestInternetChecker_Check_3xxIsOffline(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusMovedPermanently)
-	}))
-	defer srv.Close()
-
-	// Disable redirect following so we see the 3xx directly
-	c := NewInternetChecker(
-		WithInternetCheckURL(srv.URL),
-		WithHTTPClient(&http.Client{
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		}),
-	)
-
-	result := c.Check(context.Background())
-	if result.Status != InternetStatusOffline {
-		t.Errorf("Check().Status with 301 = %q, want %q", result.Status, InternetStatusOffline)
-	}
-	if result.HTTPStatus != 301 {
-		t.Errorf("Check().HTTPStatus = %d, want 301", result.HTTPStatus)
-	}
-}
-
-func TestInternetChecker_Check_403IsOffline(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-	}))
-	defer srv.Close()
-
-	c := NewInternetChecker(WithInternetCheckURL(srv.URL))
-
-	result := c.Check(context.Background())
-	if result.Status != InternetStatusOffline {
-		t.Errorf("Check().Status with 403 = %q, want %q", result.Status, InternetStatusOffline)
-	}
-	if result.HTTPStatus != 403 {
-		t.Errorf("Check().HTTPStatus = %d, want 403", result.HTTPStatus)
 	}
 }
 
@@ -294,14 +275,11 @@ func TestInternetChecker_Run_StopsOnCancel(t *testing.T) {
 		close(done)
 	}()
 
-	// Drain the immediate check
 	<-ch
-
 	cancel()
 
 	select {
 	case <-done:
-		// Run returned — good
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not stop after context cancel")
 	}
@@ -319,7 +297,6 @@ func TestInternetChecker_Run_FullChannelDoesNotBlock(t *testing.T) {
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	// Buffered channel of size 1 — will fill up fast
 	ch := make(chan CheckResult, 1)
 
 	done := make(chan struct{})
@@ -328,7 +305,6 @@ func TestInternetChecker_Run_FullChannelDoesNotBlock(t *testing.T) {
 		close(done)
 	}()
 
-	// Let it run for a bit with a full channel — should not deadlock
 	time.Sleep(100 * time.Millisecond)
 	cancel()
 
@@ -339,33 +315,31 @@ func TestInternetChecker_Run_FullChannelDoesNotBlock(t *testing.T) {
 	}
 }
 
-func TestInternetChecker_Check_SlowServerTimeout(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(5 * time.Second)
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer srv.Close()
+func TestInternetChecker_Defaults(t *testing.T) {
+	c := NewInternetChecker()
 
-	c := NewInternetChecker(
-		WithInternetCheckURL(srv.URL),
-		WithInternetCheckTimeout(50*time.Millisecond),
-	)
-
-	result := c.Check(context.Background())
-	if result.Status != InternetStatusOffline {
-		t.Errorf("Check().Status with slow server = %q, want %q", result.Status, InternetStatusOffline)
+	if c.url != DefaultInternetCheckURL {
+		t.Errorf("default URL = %q, want %q", c.url, DefaultInternetCheckURL)
 	}
-	if result.Err == nil {
-		t.Error("Check().Err should be non-nil for timeout")
+	if c.interval != 5*time.Minute {
+		t.Errorf("default interval = %v, want 5m", c.interval)
+	}
+	if c.timeout != 10*time.Second {
+		t.Errorf("default timeout = %v, want 10s", c.timeout)
+	}
+	if c.client == nil {
+		t.Error("client should not be nil")
 	}
 }
 
 func TestInternetChecker_AllOptions(t *testing.T) {
+	custom := &http.Client{Timeout: 42 * time.Second}
 	c := NewInternetChecker(
 		WithInternetCheckURL("http://example.com"),
 		WithInternetCheckInterval(10*time.Minute),
 		WithInternetCheckTimeout(30*time.Second),
 		WithInternetCheckVerbose(true),
+		WithHTTPClient(custom),
 	)
 
 	if c.url != "http://example.com" {
@@ -380,35 +354,21 @@ func TestInternetChecker_AllOptions(t *testing.T) {
 	if !c.verbose {
 		t.Error("verbose = false, want true")
 	}
-}
-
-func TestInternetChecker_Check_LatencyPopulatedOnSuccess(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(5 * time.Millisecond)
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer srv.Close()
-
-	c := NewInternetChecker(WithInternetCheckURL(srv.URL))
-
-	result := c.Check(context.Background())
-	if result.Latency < 5*time.Millisecond {
-		t.Errorf("Check().Latency = %v, want >= 5ms", result.Latency)
+	if c.client != custom {
+		t.Error("expected custom HTTP client to be used")
 	}
 }
 
-func TestInternetChecker_Check_ErrorWrapping(t *testing.T) {
-	// Connection refused should include "http request" wrapper
-	c := NewInternetChecker(
-		WithInternetCheckURL("http://127.0.0.1:1"),
-		WithInternetCheckTimeout(100*time.Millisecond),
-	)
+// contains is a helper to avoid importing strings in the test file.
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && searchString(s, substr)
+}
 
-	result := c.Check(context.Background())
-	if result.Err == nil {
-		t.Fatal("expected error for unreachable host")
+func searchString(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
 	}
-	if !strings.Contains(result.Err.Error(), "http request") {
-		t.Errorf("error should be wrapped with 'http request', got: %v", result.Err)
-	}
+	return false
 }

@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1107,29 +1109,29 @@ func TestHandleInternetCheck_OKToOffline_WithError(t *testing.T) {
 	}
 }
 
-func TestHandleInternetCheck_OKToOffline_WithHTTPStatus(t *testing.T) {
+func TestHandleInternetCheck_OKToOffline_BadHTTPStatus(t *testing.T) {
 	d, logBuf := newInternetTestDaemon()
 	tmpDir := t.TempDir()
 	d.config.EnvFilePath = filepath.Join(tmpDir, "test.env")
 	d.writer = newTestWriter(d.config.EnvFilePath)
 	d.lastState.InternetStatus = network.InternetStatusOK
 
+	// Matches what Check() actually produces for a non-2xx response:
+	// HTTPStatus is set AND Err is set.
 	d.handleInternetCheck(network.CheckResult{
 		Status:     network.InternetStatusOffline,
 		HTTPStatus: 500,
 		Latency:    150 * time.Millisecond,
-		Err:        nil, // no connection error, just bad status
+		Err:        errors.New("unexpected status 500"),
 	})
 
 	out := logBuf.String()
 	if !strings.Contains(out, "internet: ok → offline") {
 		t.Errorf("expected transition log, got: %s", out)
 	}
-	if !strings.Contains(out, "http 500") {
-		t.Errorf("expected HTTP status in log, got: %s", out)
-	}
-	if !strings.Contains(out, "150ms") {
-		t.Errorf("expected latency in log, got: %s", out)
+	// When Err is set, the error branch is taken (not the http status branch)
+	if !strings.Contains(out, "unexpected status 500") {
+		t.Errorf("expected error detail in log, got: %s", out)
 	}
 }
 
@@ -1152,22 +1154,24 @@ func TestHandleInternetCheck_StillOffline_LogsEveryFailure(t *testing.T) {
 	}
 }
 
-func TestHandleInternetCheck_StillOffline_WithHTTPStatus(t *testing.T) {
+func TestHandleInternetCheck_StillOffline_BadHTTPStatus(t *testing.T) {
 	d, logBuf := newInternetTestDaemon()
 	d.lastState.InternetStatus = network.InternetStatusOffline
 
+	// Matches what Check() produces: Err is always set for non-2xx
 	d.handleInternetCheck(network.CheckResult{
 		Status:     network.InternetStatusOffline,
 		HTTPStatus: 503,
 		Latency:    200 * time.Millisecond,
+		Err:        errors.New("unexpected status 503"),
 	})
 
 	out := logBuf.String()
 	if !strings.Contains(out, "still offline") {
 		t.Errorf("expected 'still offline' log, got: %s", out)
 	}
-	if !strings.Contains(out, "http 503") {
-		t.Errorf("expected HTTP status in 'still offline' log, got: %s", out)
+	if !strings.Contains(out, "unexpected status 503") {
+		t.Errorf("expected error detail in 'still offline' log, got: %s", out)
 	}
 }
 
@@ -1279,6 +1283,95 @@ func TestHandleInternetCheck_OfflineToOK_Recovery(t *testing.T) {
 	}
 	if !strings.Contains(out, "85ms") {
 		t.Errorf("expected latency in recovery log, got: %s", out)
+	}
+}
+
+// TestInternetCheck_RunToDaemon_Integration verifies the full pipeline:
+// InternetChecker.Run produces CheckResults on a channel, the daemon consumes
+// them via handleInternetCheck, and the correct log lines appear for each
+// transition. This catches wiring issues that the unit tests for each layer
+// individually would miss.
+func TestInternetCheck_RunToDaemon_Integration(t *testing.T) {
+	// Server that starts healthy, then becomes unhealthy after 2 requests.
+	var reqCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := reqCount.Add(1)
+		if n <= 2 {
+			w.WriteHeader(http.StatusNoContent)
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	defer srv.Close()
+
+	checker := network.NewInternetChecker(
+		network.WithInternetCheckURL(srv.URL),
+		network.WithInternetCheckInterval(50*time.Millisecond),
+	)
+
+	tmpDir := t.TempDir()
+	var logBuf bytes.Buffer
+	d := &Daemon{
+		config: Config{
+			EnvFilePath: filepath.Join(tmpDir, "integration.env"),
+		},
+		logger: log.New(&logBuf, "", 0),
+		writer: newTestWriter(filepath.Join(tmpDir, "integration.env")),
+		lastState: network.State{
+			InternetStatus: network.InternetStatusUnknown,
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch := make(chan network.CheckResult, 10)
+	go checker.Run(ctx, ch)
+
+	// Consume results until we see at least one OK and one offline transition.
+	var sawOK, sawOffline bool
+	deadline := time.After(5 * time.Second)
+	for !sawOK || !sawOffline {
+		select {
+		case result := <-ch:
+			d.handleInternetCheck(result)
+			if d.lastState.InternetStatus == network.InternetStatusOK {
+				sawOK = true
+			}
+			if d.lastState.InternetStatus == network.InternetStatusOffline {
+				sawOffline = true
+			}
+		case <-deadline:
+			t.Fatalf("timed out: sawOK=%v sawOffline=%v log:\n%s", sawOK, sawOffline, logBuf.String())
+		}
+	}
+
+	cancel()
+
+	out := logBuf.String()
+
+	// Should see the unknown → ok transition
+	if !strings.Contains(out, "internet: unknown → ok") {
+		t.Errorf("expected unknown→ok transition, got:\n%s", out)
+	}
+
+	// Should see the ok → offline transition with error detail
+	if !strings.Contains(out, "internet: ok → offline") {
+		t.Errorf("expected ok→offline transition, got:\n%s", out)
+	}
+
+	// The offline transition should include the actual error from Check()
+	if !strings.Contains(out, "unexpected status 503") {
+		t.Errorf("expected error detail from Check() in log, got:\n%s", out)
+	}
+
+	// Env file should have been written (at least for the first transition)
+	content, err := os.ReadFile(filepath.Join(tmpDir, "integration.env"))
+	if err != nil {
+		t.Fatalf("failed to read env file: %v", err)
+	}
+	if !strings.Contains(string(content), "NETWORK_INTERNET_STATUS=") {
+		t.Errorf("env file missing NETWORK_INTERNET_STATUS, got: %s", content)
 	}
 }
 
