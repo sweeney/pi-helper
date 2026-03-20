@@ -12,8 +12,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sweeney/pi-helper/internal/envwriter"
 	"github.com/sweeney/pi-helper/internal/network"
 )
+
+// newTestWriter creates a FileWriter for testing.
+func newTestWriter(path string) *envwriter.FileWriter {
+	return envwriter.New(path)
+}
 
 func TestDefaultConfig(t *testing.T) {
 	config := DefaultConfig()
@@ -29,6 +35,9 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if config.WifiRecoveryDelay != 60*time.Second {
 		t.Errorf("DefaultConfig().WifiRecoveryDelay = %v, want 60s", config.WifiRecoveryDelay)
+	}
+	if config.InternetCheckInterval != 5*time.Minute {
+		t.Errorf("DefaultConfig().InternetCheckInterval = %v, want 5m", config.InternetCheckInterval)
 	}
 }
 
@@ -125,6 +134,46 @@ func TestNew(t *testing.T) {
 	}
 	if d.logger == nil {
 		t.Error("daemon.logger is nil")
+	}
+}
+
+func TestNew_InternetCheckerEnabled(t *testing.T) {
+	config := Config{
+		EnvFilePath:           "/tmp/test.env",
+		PollInterval:          10 * time.Second,
+		InternetCheckInterval: 5 * time.Minute,
+	}
+
+	d := New(config)
+	if d.internetChecker == nil {
+		t.Error("internetChecker should be non-nil when interval > 0")
+	}
+}
+
+func TestNew_InternetCheckerDisabled(t *testing.T) {
+	config := Config{
+		EnvFilePath:           "/tmp/test.env",
+		PollInterval:          10 * time.Second,
+		InternetCheckInterval: 0,
+	}
+
+	d := New(config)
+	if d.internetChecker != nil {
+		t.Error("internetChecker should be nil when interval = 0")
+	}
+}
+
+func TestNew_InternetCheckerCustomURL(t *testing.T) {
+	config := Config{
+		EnvFilePath:           "/tmp/test.env",
+		PollInterval:          10 * time.Second,
+		InternetCheckInterval: 5 * time.Minute,
+		InternetCheckURL:      "https://example.com/check",
+	}
+
+	d := New(config)
+	if d.internetChecker == nil {
+		t.Error("internetChecker should be non-nil with custom URL")
 	}
 }
 
@@ -984,5 +1033,113 @@ func TestNMFuncs_UsesInjected(t *testing.T) {
 
 	if !called {
 		t.Error("expected injected WifiConnections to be called")
+	}
+}
+
+// --- handleInternetStatus tests ---
+
+func newInternetTestDaemon() (*Daemon, *bytes.Buffer) {
+	tmpDir := os.TempDir()
+	var buf bytes.Buffer
+	return &Daemon{
+		config: Config{
+			EnvFilePath: filepath.Join(tmpDir, "internet-test.env"),
+		},
+		logger: log.New(&buf, "", 0),
+		writer: nil, // will set below
+		lastState: network.State{
+			InternetStatus: network.InternetStatusUnknown,
+		},
+	}, &buf
+}
+
+func TestHandleInternetStatus_ChangesState(t *testing.T) {
+	d, logBuf := newInternetTestDaemon()
+	tmpDir := t.TempDir()
+	d.config.EnvFilePath = filepath.Join(tmpDir, "test.env")
+	// Use a real writer so writeState works
+	d.writer = newTestWriter(d.config.EnvFilePath)
+
+	d.handleInternetStatus(network.InternetStatusOK)
+
+	if d.lastState.InternetStatus != network.InternetStatusOK {
+		t.Errorf("lastState.InternetStatus = %q, want %q", d.lastState.InternetStatus, network.InternetStatusOK)
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, "internet: unknown → ok") {
+		t.Errorf("expected transition log, got: %s", out)
+	}
+}
+
+func TestHandleInternetStatus_NoChangeNoLog(t *testing.T) {
+	d, logBuf := newInternetTestDaemon()
+	d.lastState.InternetStatus = network.InternetStatusOK
+
+	d.handleInternetStatus(network.InternetStatusOK)
+
+	out := logBuf.String()
+	if out != "" {
+		t.Errorf("expected no log when status unchanged, got: %s", out)
+	}
+}
+
+func TestHandleInternetStatus_OKToOffline(t *testing.T) {
+	d, logBuf := newInternetTestDaemon()
+	tmpDir := t.TempDir()
+	d.config.EnvFilePath = filepath.Join(tmpDir, "test.env")
+	d.writer = newTestWriter(d.config.EnvFilePath)
+	d.lastState.InternetStatus = network.InternetStatusOK
+
+	d.handleInternetStatus(network.InternetStatusOffline)
+
+	if d.lastState.InternetStatus != network.InternetStatusOffline {
+		t.Errorf("lastState.InternetStatus = %q, want %q", d.lastState.InternetStatus, network.InternetStatusOffline)
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, "internet: ok → offline") {
+		t.Errorf("expected transition log, got: %s", out)
+	}
+}
+
+func TestHandleInternetStatus_WritesEnvFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	envPath := filepath.Join(tmpDir, "test.env")
+
+	d, _ := newInternetTestDaemon()
+	d.config.EnvFilePath = envPath
+	d.writer = newTestWriter(envPath)
+
+	d.handleInternetStatus(network.InternetStatusOK)
+
+	content, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("failed to read env file: %v", err)
+	}
+	if !strings.Contains(string(content), "NETWORK_INTERNET_STATUS=ok") {
+		t.Errorf("env file should contain NETWORK_INTERNET_STATUS=ok, got: %s", content)
+	}
+}
+
+func TestLogStateTransition_InternetStatusChange(t *testing.T) {
+	d, logBuf := newTestDaemonWithLog(0, nil)
+	d.lastState = network.State{
+		Status:         network.StatusConnected,
+		InternetStatus: network.InternetStatusOK,
+	}
+
+	d.logStateTransition(network.State{
+		Status:         network.StatusConnected,
+		InternetStatus: network.InternetStatusOffline,
+	})
+
+	out := logBuf.String()
+	if !strings.Contains(out, "internet: ok → offline") {
+		t.Errorf("expected internet change in log, got: %s", out)
+	}
+	// Should NOT contain status change
+	if strings.Contains(out, "status:") {
+		t.Errorf("unexpected status change in log: %s", out)
 	}
 }
