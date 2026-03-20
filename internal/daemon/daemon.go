@@ -107,9 +107,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.applyWifiConfig()
 
 	// Start internet checker if enabled
-	var internetCh <-chan string
+	var internetCh <-chan network.CheckResult
 	if d.internetChecker != nil {
-		ch := make(chan string, 1)
+		ch := make(chan network.CheckResult, 1)
 		internetCh = ch
 		go d.internetChecker.Run(ctx, ch)
 		d.logger.Printf("internet check enabled every %v", d.config.InternetCheckInterval)
@@ -143,12 +143,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			recoveryCh = nil
 			d.attemptWifiRecovery(ctx)
 
-		case status, ok := <-internetCh:
+		case result, ok := <-internetCh:
 			if !ok {
 				internetCh = nil
 				continue
 			}
-			d.handleInternetStatus(status)
+			d.handleInternetCheck(result)
 		}
 	}
 }
@@ -334,14 +334,47 @@ func (d *Daemon) ensureInfiniteAutoconnectRetries() {
 	}
 }
 
-// handleInternetStatus updates the state with the latest internet check result.
-func (d *Daemon) handleInternetStatus(status string) {
-	if d.lastState.InternetStatus == status {
+// handleInternetCheck updates the state with the latest internet check result
+// and logs diagnostics useful for post-mortem analysis via journalctl.
+func (d *Daemon) handleInternetCheck(result network.CheckResult) {
+	prev := d.lastState.InternetStatus
+	changed := prev != result.Status
+
+	if changed {
+		switch {
+		case result.Status == network.InternetStatusOffline:
+			// Connectivity lost — always log with full detail
+			if result.Err != nil {
+				d.logger.Printf("internet: %s → %s (error: %v)", prev, result.Status, result.Err)
+			} else {
+				d.logger.Printf("internet: %s → %s (http %d, %s)", prev, result.Status, result.HTTPStatus, result.Latency.Round(time.Millisecond))
+			}
+		case result.Status == network.InternetStatusOK:
+			// Connectivity restored — log recovery with latency
+			d.logger.Printf("internet: %s → %s (http %d, %s)", prev, result.Status, result.HTTPStatus, result.Latency.Round(time.Millisecond))
+		default:
+			d.logger.Printf("internet: %s → %s", prev, result.Status)
+		}
+
+		d.lastState.InternetStatus = result.Status
+		d.writeState(d.lastState)
 		return
 	}
-	d.logger.Printf("internet: %s → %s", d.lastState.InternetStatus, status)
-	d.lastState.InternetStatus = status
-	d.writeState(d.lastState)
+
+	// No state change — still log failures so every missed check is visible in the journal
+	if result.Status == network.InternetStatusOffline {
+		if result.Err != nil {
+			d.logger.Printf("internet: still offline (error: %v)", result.Err)
+		} else {
+			d.logger.Printf("internet: still offline (http %d, %s)", result.HTTPStatus, result.Latency.Round(time.Millisecond))
+		}
+		return
+	}
+
+	// Steady-state OK — only log in verbose mode
+	if d.config.Verbose {
+		d.logger.Printf("internet: ok (http %d, %s)", result.HTTPStatus, result.Latency.Round(time.Millisecond))
+	}
 }
 
 // writeState writes the current network state to the env file.

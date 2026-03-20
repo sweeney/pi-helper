@@ -1036,7 +1036,7 @@ func TestNMFuncs_UsesInjected(t *testing.T) {
 	}
 }
 
-// --- handleInternetStatus tests ---
+// --- handleInternetCheck tests ---
 
 func newInternetTestDaemon() (*Daemon, *bytes.Buffer) {
 	tmpDir := os.TempDir()
@@ -1046,21 +1046,24 @@ func newInternetTestDaemon() (*Daemon, *bytes.Buffer) {
 			EnvFilePath: filepath.Join(tmpDir, "internet-test.env"),
 		},
 		logger: log.New(&buf, "", 0),
-		writer: nil, // will set below
+		writer: nil, // set per-test
 		lastState: network.State{
 			InternetStatus: network.InternetStatusUnknown,
 		},
 	}, &buf
 }
 
-func TestHandleInternetStatus_ChangesState(t *testing.T) {
+func TestHandleInternetCheck_UnknownToOK(t *testing.T) {
 	d, logBuf := newInternetTestDaemon()
 	tmpDir := t.TempDir()
 	d.config.EnvFilePath = filepath.Join(tmpDir, "test.env")
-	// Use a real writer so writeState works
 	d.writer = newTestWriter(d.config.EnvFilePath)
 
-	d.handleInternetStatus(network.InternetStatusOK)
+	d.handleInternetCheck(network.CheckResult{
+		Status:     network.InternetStatusOK,
+		HTTPStatus: 204,
+		Latency:    42 * time.Millisecond,
+	})
 
 	if d.lastState.InternetStatus != network.InternetStatusOK {
 		t.Errorf("lastState.InternetStatus = %q, want %q", d.lastState.InternetStatus, network.InternetStatusOK)
@@ -1070,28 +1073,26 @@ func TestHandleInternetStatus_ChangesState(t *testing.T) {
 	if !strings.Contains(out, "internet: unknown → ok") {
 		t.Errorf("expected transition log, got: %s", out)
 	}
-}
-
-func TestHandleInternetStatus_NoChangeNoLog(t *testing.T) {
-	d, logBuf := newInternetTestDaemon()
-	d.lastState.InternetStatus = network.InternetStatusOK
-
-	d.handleInternetStatus(network.InternetStatusOK)
-
-	out := logBuf.String()
-	if out != "" {
-		t.Errorf("expected no log when status unchanged, got: %s", out)
+	if !strings.Contains(out, "http 204") {
+		t.Errorf("expected HTTP status in log, got: %s", out)
+	}
+	if !strings.Contains(out, "42ms") {
+		t.Errorf("expected latency in log, got: %s", out)
 	}
 }
 
-func TestHandleInternetStatus_OKToOffline(t *testing.T) {
+func TestHandleInternetCheck_OKToOffline_WithError(t *testing.T) {
 	d, logBuf := newInternetTestDaemon()
 	tmpDir := t.TempDir()
 	d.config.EnvFilePath = filepath.Join(tmpDir, "test.env")
 	d.writer = newTestWriter(d.config.EnvFilePath)
 	d.lastState.InternetStatus = network.InternetStatusOK
 
-	d.handleInternetStatus(network.InternetStatusOffline)
+	d.handleInternetCheck(network.CheckResult{
+		Status:  network.InternetStatusOffline,
+		Latency: 10 * time.Second,
+		Err:     errors.New("http request: dial tcp 142.250.80.46:443: i/o timeout"),
+	})
 
 	if d.lastState.InternetStatus != network.InternetStatusOffline {
 		t.Errorf("lastState.InternetStatus = %q, want %q", d.lastState.InternetStatus, network.InternetStatusOffline)
@@ -1101,9 +1102,115 @@ func TestHandleInternetStatus_OKToOffline(t *testing.T) {
 	if !strings.Contains(out, "internet: ok → offline") {
 		t.Errorf("expected transition log, got: %s", out)
 	}
+	if !strings.Contains(out, "i/o timeout") {
+		t.Errorf("expected error detail in log, got: %s", out)
+	}
 }
 
-func TestHandleInternetStatus_WritesEnvFile(t *testing.T) {
+func TestHandleInternetCheck_OKToOffline_WithHTTPStatus(t *testing.T) {
+	d, logBuf := newInternetTestDaemon()
+	tmpDir := t.TempDir()
+	d.config.EnvFilePath = filepath.Join(tmpDir, "test.env")
+	d.writer = newTestWriter(d.config.EnvFilePath)
+	d.lastState.InternetStatus = network.InternetStatusOK
+
+	d.handleInternetCheck(network.CheckResult{
+		Status:     network.InternetStatusOffline,
+		HTTPStatus: 500,
+		Latency:    150 * time.Millisecond,
+		Err:        nil, // no connection error, just bad status
+	})
+
+	out := logBuf.String()
+	if !strings.Contains(out, "internet: ok → offline") {
+		t.Errorf("expected transition log, got: %s", out)
+	}
+	if !strings.Contains(out, "http 500") {
+		t.Errorf("expected HTTP status in log, got: %s", out)
+	}
+	if !strings.Contains(out, "150ms") {
+		t.Errorf("expected latency in log, got: %s", out)
+	}
+}
+
+func TestHandleInternetCheck_StillOffline_LogsEveryFailure(t *testing.T) {
+	d, logBuf := newInternetTestDaemon()
+	d.lastState.InternetStatus = network.InternetStatusOffline
+
+	d.handleInternetCheck(network.CheckResult{
+		Status:  network.InternetStatusOffline,
+		Latency: 10 * time.Second,
+		Err:     errors.New("http request: dial tcp: no route to host"),
+	})
+
+	out := logBuf.String()
+	if !strings.Contains(out, "still offline") {
+		t.Errorf("expected 'still offline' log, got: %s", out)
+	}
+	if !strings.Contains(out, "no route to host") {
+		t.Errorf("expected error detail in 'still offline' log, got: %s", out)
+	}
+}
+
+func TestHandleInternetCheck_StillOffline_WithHTTPStatus(t *testing.T) {
+	d, logBuf := newInternetTestDaemon()
+	d.lastState.InternetStatus = network.InternetStatusOffline
+
+	d.handleInternetCheck(network.CheckResult{
+		Status:     network.InternetStatusOffline,
+		HTTPStatus: 503,
+		Latency:    200 * time.Millisecond,
+	})
+
+	out := logBuf.String()
+	if !strings.Contains(out, "still offline") {
+		t.Errorf("expected 'still offline' log, got: %s", out)
+	}
+	if !strings.Contains(out, "http 503") {
+		t.Errorf("expected HTTP status in 'still offline' log, got: %s", out)
+	}
+}
+
+func TestHandleInternetCheck_StillOK_NoLogByDefault(t *testing.T) {
+	d, logBuf := newInternetTestDaemon()
+	d.lastState.InternetStatus = network.InternetStatusOK
+
+	d.handleInternetCheck(network.CheckResult{
+		Status:     network.InternetStatusOK,
+		HTTPStatus: 204,
+		Latency:    30 * time.Millisecond,
+	})
+
+	out := logBuf.String()
+	if out != "" {
+		t.Errorf("expected no log when status unchanged and not verbose, got: %s", out)
+	}
+}
+
+func TestHandleInternetCheck_StillOK_VerboseLogsLatency(t *testing.T) {
+	d, logBuf := newInternetTestDaemon()
+	d.config.Verbose = true
+	d.lastState.InternetStatus = network.InternetStatusOK
+
+	d.handleInternetCheck(network.CheckResult{
+		Status:     network.InternetStatusOK,
+		HTTPStatus: 204,
+		Latency:    30 * time.Millisecond,
+	})
+
+	out := logBuf.String()
+	if !strings.Contains(out, "internet: ok") {
+		t.Errorf("expected verbose ok log, got: %s", out)
+	}
+	if !strings.Contains(out, "http 204") {
+		t.Errorf("expected HTTP status in verbose log, got: %s", out)
+	}
+	if !strings.Contains(out, "30ms") {
+		t.Errorf("expected latency in verbose log, got: %s", out)
+	}
+}
+
+func TestHandleInternetCheck_WritesEnvFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	envPath := filepath.Join(tmpDir, "test.env")
 
@@ -1111,7 +1218,11 @@ func TestHandleInternetStatus_WritesEnvFile(t *testing.T) {
 	d.config.EnvFilePath = envPath
 	d.writer = newTestWriter(envPath)
 
-	d.handleInternetStatus(network.InternetStatusOK)
+	d.handleInternetCheck(network.CheckResult{
+		Status:     network.InternetStatusOK,
+		HTTPStatus: 204,
+		Latency:    50 * time.Millisecond,
+	})
 
 	content, err := os.ReadFile(envPath)
 	if err != nil {
@@ -1119,6 +1230,55 @@ func TestHandleInternetStatus_WritesEnvFile(t *testing.T) {
 	}
 	if !strings.Contains(string(content), "NETWORK_INTERNET_STATUS=ok") {
 		t.Errorf("env file should contain NETWORK_INTERNET_STATUS=ok, got: %s", content)
+	}
+}
+
+func TestHandleInternetCheck_StillOfflineDoesNotWriteEnv(t *testing.T) {
+	tmpDir := t.TempDir()
+	envPath := filepath.Join(tmpDir, "test.env")
+
+	d, _ := newInternetTestDaemon()
+	d.config.EnvFilePath = envPath
+	d.writer = newTestWriter(envPath)
+	d.lastState.InternetStatus = network.InternetStatusOffline
+
+	d.handleInternetCheck(network.CheckResult{
+		Status: network.InternetStatusOffline,
+		Err:    errors.New("timeout"),
+	})
+
+	// File should not exist since state didn't change
+	if _, err := os.Stat(envPath); err == nil {
+		t.Error("env file should not be written when status unchanged")
+	}
+}
+
+func TestHandleInternetCheck_OfflineToOK_Recovery(t *testing.T) {
+	d, logBuf := newInternetTestDaemon()
+	tmpDir := t.TempDir()
+	d.config.EnvFilePath = filepath.Join(tmpDir, "test.env")
+	d.writer = newTestWriter(d.config.EnvFilePath)
+	d.lastState.InternetStatus = network.InternetStatusOffline
+
+	d.handleInternetCheck(network.CheckResult{
+		Status:     network.InternetStatusOK,
+		HTTPStatus: 204,
+		Latency:    85 * time.Millisecond,
+	})
+
+	if d.lastState.InternetStatus != network.InternetStatusOK {
+		t.Errorf("lastState.InternetStatus = %q, want %q", d.lastState.InternetStatus, network.InternetStatusOK)
+	}
+
+	out := logBuf.String()
+	if !strings.Contains(out, "internet: offline → ok") {
+		t.Errorf("expected recovery log, got: %s", out)
+	}
+	if !strings.Contains(out, "http 204") {
+		t.Errorf("expected HTTP status in recovery log, got: %s", out)
+	}
+	if !strings.Contains(out, "85ms") {
+		t.Errorf("expected latency in recovery log, got: %s", out)
 	}
 }
 
