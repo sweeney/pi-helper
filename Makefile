@@ -1,4 +1,4 @@
-.PHONY: build build-pi-zero build-pi-zero2 build-all test lint clean
+.PHONY: build build-pi-zero build-pi-zero2 build-all test lint clean deploy
 
 # Default build for current platform
 build:
@@ -26,3 +26,9 @@ lint:
 # Clean build artifacts
 clean:
 	rm -rf dist/
+
+# Deploy to remote host. Usage: make deploy HOST=user@host
+deploy:
+	@test -n "$(HOST)" || (echo "Usage: make deploy HOST=user@host" && exit 1)
+	@chmod +x deploy/deploy.sh
+	./deploy/deploy.sh $(HOST)

@@ -1,13 +1,27 @@
 [Unit]
 Description=Pi Helper Daemon
-After=local-fs.target
-Wants=network.target
+After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/pi-helper
+ExecStart=/opt/pi-helper/bin/pi-helper
 Restart=always
 RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pi-helper
 
 [Install]
 WantedBy=multi-user.target
