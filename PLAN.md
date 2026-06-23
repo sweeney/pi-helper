@@ -138,7 +138,7 @@ Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/pi-helper
+ExecStart=/opt/pi-helper/bin/pi-helper
 Restart=always
 RestartSec=5
 
@@ -179,30 +179,20 @@ EnvironmentFile=-/run/pi-helper.env
 pi-helper [flags]
 
 Flags:
-  --env-file string      Path to env file (default "/run/pi-helper.env")
-  --poll-interval duration   Polling interval (default 30s)
-  --verbose              Enable verbose logging
-  --version              Print version and exit
+  --env-file string            Path to env file (default "/run/pi-helper.env")
+  --poll-interval duration     Polling interval (default 30s)
+  --wifi-recovery-delay duration  Grace period before nudging dropped WiFi (default 60s, 0 disables)
+  --verbose                    Enable verbose logging
+  --version                    Print version and exit
 ```
 
 ## Deployment
 
-### First-time setup
-```bash
-# On dev machine: build and copy files
-make build-pi-zero  # or build-pi-zero2
-scp dist/pi-helper-armv6 pi@host:~/pi-helper/pi-helper
-scp pi-helper.service setup.sh pi@host:~/pi-helper/
-
-# On Pi: run setup
-cd ~/pi-helper && sudo ./setup.sh
-```
-
-### Subsequent deploys
-```bash
-scp dist/pi-helper-armv6 pi@host:~/pi-helper/pi-helper
-ssh pi@host 'sudo systemctl restart pi-helper'
-```
+> The README is authoritative for install/deploy. In short: run `sudo ./setup.sh`
+> once on the Pi to install to `/opt/pi-helper/bin` and enable the service, then
+> `make deploy HOST=user@host` from the repo. `deploy/deploy.sh` auto-detects the
+> target architecture, ships a versioned binary, swaps the active symlink, restarts,
+> and verifies the running version.
 
 ## Implementation Order
 

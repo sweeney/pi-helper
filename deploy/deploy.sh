@@ -12,8 +12,25 @@ KEEP_VERSIONS=3
 VERSION=$(date +%Y%m%d-%H%M%S)
 REMOTE_BIN="${BINARY}-${VERSION}"
 
-echo "=== Building $BINARY for linux/arm64 ==="
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build \
+echo "=== Detecting remote architecture on $REMOTE ==="
+REMOTE_ARCH=$(ssh "$REMOTE" "uname -m")
+
+# Map the remote machine architecture to Go build settings.
+GOARM=""
+case "$REMOTE_ARCH" in
+  aarch64|arm64)  GOOS=linux GOARCH=arm64 ;;
+  armv7l)         GOOS=linux GOARCH=arm GOARM=7 ;;
+  armv6l)         GOOS=linux GOARCH=arm GOARM=6 ;;
+  x86_64|amd64)   GOOS=linux GOARCH=amd64 ;;
+  *)
+    echo "  x Unsupported remote architecture: $REMOTE_ARCH" >&2
+    exit 1
+    ;;
+esac
+echo "  $REMOTE_ARCH -> GOOS=$GOOS GOARCH=$GOARCH${GOARM:+ GOARM=$GOARM}"
+
+echo "=== Building $BINARY for $GOOS/$GOARCH${GOARM:+v$GOARM} ==="
+env GOOS=$GOOS GOARCH=$GOARCH ${GOARM:+GOARM=$GOARM} CGO_ENABLED=0 go build \
   -ldflags "-X main.version=${VERSION}" \
   -o "$BUILD_DIR/$BINARY" "$MAIN"
 
@@ -27,12 +44,29 @@ ssh "$REMOTE" "sudo systemctl restart $SERVICE"
 
 echo "=== Verifying ==="
 sleep 2
-if ssh "$REMOTE" "sudo systemctl is-active --quiet $SERVICE"; then
-  echo "  v $SERVICE is running"
-else
+if ! ssh "$REMOTE" "sudo systemctl is-active --quiet $SERVICE"; then
   echo "  x $SERVICE failed to start"
   ssh "$REMOTE" "sudo journalctl -u $SERVICE -n 20 --no-pager"
   exit 1
+fi
+echo "  v $SERVICE is running"
+
+# Confirm the running binary is the one we just deployed. A service can be
+# active while still running a stale binary if the symlink swap or restart
+# silently failed, so is-active alone is not enough.
+RUNNING_VERSION=$(ssh "$REMOTE" "$DEPLOY_DIR/$BINARY -version" | awk '{print $NF}')
+if [ "$RUNNING_VERSION" != "$VERSION" ]; then
+  echo "  x version mismatch: expected $VERSION, running $RUNNING_VERSION"
+  ssh "$REMOTE" "sudo journalctl -u $SERVICE -n 20 --no-pager"
+  exit 1
+fi
+echo "  v running version $RUNNING_VERSION matches deployed build"
+
+# Confirm the daemon has written its env file (proves it reached steady state).
+if ssh "$REMOTE" "test -s /run/$SERVICE.env"; then
+  echo "  v /run/$SERVICE.env written"
+else
+  echo "  ! /run/$SERVICE.env not written yet (daemon may still be starting)"
 fi
 
 echo "=== Cleaning old versions (keeping $KEEP_VERSIONS) ==="
