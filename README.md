@@ -32,6 +32,13 @@ pi-helper writes the following variables to `/run/pi-helper.env`:
 | `NETWORK_GATEWAY` | e.g., `192.168.1.1` | Default gateway |
 | `NETWORK_WIFI_STATUS` | `connected`, `disconnected`, `no-hardware` | Wifi-specific status |
 | `NETWORK_WIFI_SSID` | e.g., `MyNetwork` | Connected wifi network name |
+| `NETWORK_HOST` | e.g., `piz2c` | System hostname (empty if unset or unreadable) |
+
+Every variable is always present; a value that cannot be determined is written
+as an empty string rather than omitted, so consumers can rely on the key
+existing. `NETWORK_HOST` is whatever the system reports (short name on a
+default Pi install, FQDN if one is configured); it is re-read on every poll, so
+a hostname change is picked up without restarting the daemon.
 
 ## Installation
 
@@ -70,13 +77,16 @@ make deploy HOST=pi@raspberrypi.local
 
 - **Detects the target architecture** over SSH (`uname -m`) and builds the matching binary — `arm64`, `armv7`, `armv6`, or `amd64`. No need to pick a build target by hand.
 - Uploads a timestamp-versioned binary to `/opt/pi-helper/bin/pi-helper-<version>` and atomically swaps the `pi-helper` symlink to point at it.
-- Restarts the service and **verifies** the deploy: the service is active, the running binary reports the version just built, and `/run/pi-helper.env` has been written.
+- Restarts the service and **verifies** the deploy: the service is active, the running binary reports the version just built, and `/run/pi-helper.env` has been written *by the new process*. `/run` is tmpfs and survives a service restart, so the env file is deleted before the restart — otherwise the previous process's file would satisfy the check and a daemon that never wrote anything would look healthy. The check then waits up to 30s for the file to reappear (on a Pi, wifi can take ~10s to associate) and prints its contents.
 - Prunes old versioned binaries, keeping the most recent 3 (so rollback is just re-pointing the symlink).
 
 Verify manually any time with:
 
 ```bash
 ssh pi@raspberrypi.local 'systemctl status pi-helper && cat /run/pi-helper.env'
+
+# Confirm NETWORK_HOST agrees with the host itself
+ssh pi@raspberrypi.local 'hostname; grep NETWORK_HOST /run/pi-helper.env'
 ```
 
 ## Building from Source
@@ -168,9 +178,9 @@ The `-` prefix on `EnvironmentFile` makes it optional (service starts even if fi
 source /run/pi-helper.env
 
 if [ "$NETWORK_STATUS" = "connected" ]; then
-    echo "Connected via $NETWORK_TYPE at $NETWORK_IP"
+    echo "$NETWORK_HOST connected via $NETWORK_TYPE at $NETWORK_IP"
 else
-    echo "Network disconnected"
+    echo "$NETWORK_HOST network disconnected"
 fi
 ```
 
@@ -193,7 +203,7 @@ def load_pi_helper_env():
 
 env = load_pi_helper_env()
 if env.get('NETWORK_STATUS') == 'connected':
-    print(f"Connected: {env.get('NETWORK_IP')}")
+    print(f"{env.get('NETWORK_HOST')} connected: {env.get('NETWORK_IP')}")
 ```
 
 ## Development
@@ -231,9 +241,11 @@ go test -race ./...     # With race detector
 
 3. **Atomic Writes**: When state changes, pi-helper writes to a temporary file then atomically renames it to `/run/pi-helper.env`, ensuring readers never see partial writes.
 
-4. **Interface Detection**: Determines interface type by name pattern (`wlan*` = wifi, `eth*`/`enp*` = ethernet) and finds the primary interface by checking which has the default route.
+4. **Hostname**: Each poll reads the system hostname (`os.Hostname`) into `NETWORK_HOST`. The value is validated against the RFC 1123 character set before being published, because consumers `source` the env file as shell; anything unexpected (including the kernel's `(none)` placeholder on an unconfigured host) is written as an empty value and logged once.
 
-5. **WiFi Resilience**: At startup, pi-helper disables WiFi power save and sets NetworkManager's `autoconnect-retries` to infinite on all wireless connections. While running, it nudges a dropped WiFi connection back up via `nmcli` after a grace period (see below).
+5. **Interface Detection**: Determines interface type by name pattern (`wlan*` = wifi, `eth*`/`enp*` = ethernet) and finds the primary interface by checking which has the default route.
+
+6. **WiFi Resilience**: At startup, pi-helper disables WiFi power save and sets NetworkManager's `autoconnect-retries` to infinite on all wireless connections. While running, it nudges a dropped WiFi connection back up via `nmcli` after a grace period (see below).
 
 ## WiFi Resilience
 

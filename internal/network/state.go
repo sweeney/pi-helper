@@ -30,6 +30,7 @@ type State struct {
 	Gateway    string
 	WifiStatus string // "connected", "disconnected", "no-hardware"
 	WifiSSID   string
+	Host       string // system hostname
 }
 
 // NewState creates a new State with default disconnected values.
@@ -65,6 +66,7 @@ func (s State) ToEnvVars() map[string]string {
 		"NETWORK_GATEWAY":     s.Gateway,
 		"NETWORK_WIFI_STATUS": s.WifiStatus,
 		"NETWORK_WIFI_SSID":   s.WifiSSID,
+		"NETWORK_HOST":        s.Host,
 	}
 }
 
@@ -75,5 +77,6 @@ func (s State) Equal(other State) bool {
 		s.IP == other.IP &&
 		s.Gateway == other.Gateway &&
 		s.WifiStatus == other.WifiStatus &&
-		s.WifiSSID == other.WifiSSID
+		s.WifiSSID == other.WifiSSID &&
+		s.Host == other.Host
 }

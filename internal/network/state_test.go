@@ -89,6 +89,7 @@ func TestState_ToEnvVars(t *testing.T) {
 		Gateway:    "192.168.1.1",
 		WifiStatus: WifiStatusConnected,
 		WifiSSID:   "MyNetwork",
+		Host:       "foobar",
 	}
 
 	vars := state.ToEnvVars()
@@ -100,6 +101,7 @@ func TestState_ToEnvVars(t *testing.T) {
 		"NETWORK_GATEWAY":     "192.168.1.1",
 		"NETWORK_WIFI_STATUS": "connected",
 		"NETWORK_WIFI_SSID":   "MyNetwork",
+		"NETWORK_HOST":        "foobar",
 	}
 
 	for k, want := range expected {

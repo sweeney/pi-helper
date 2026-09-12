@@ -8,6 +8,8 @@ BUILD_DIR="dist"
 DEPLOY_DIR="/opt/${SERVICE}/bin"
 MAIN="./cmd/pi-helper/"
 KEEP_VERSIONS=3
+ENV_FILE="/run/${SERVICE}.env"
+ENV_FILE_TIMEOUT=30
 
 VERSION=$(date +%Y%m%d-%H%M%S)
 REMOTE_BIN="${BINARY}-${VERSION}"
@@ -40,6 +42,11 @@ ssh "$REMOTE" "chmod 755 $DEPLOY_DIR/$REMOTE_BIN"
 
 echo "=== Activating $REMOTE_BIN ==="
 ssh "$REMOTE" "ln -sfn $DEPLOY_DIR/$REMOTE_BIN $DEPLOY_DIR/$BINARY"
+
+# Remove the env file before restarting. /run is tmpfs and survives a service
+# restart, so the previous process's file would otherwise linger and make the
+# freshness check below pass against stale content.
+ssh "$REMOTE" "sudo rm -f $ENV_FILE"
 ssh "$REMOTE" "sudo systemctl restart $SERVICE"
 
 echo "=== Verifying ==="
@@ -63,10 +70,25 @@ fi
 echo "  v running version $RUNNING_VERSION matches deployed build"
 
 # Confirm the daemon has written its env file (proves it reached steady state).
-if ssh "$REMOTE" "test -s /run/$SERVICE.env"; then
-  echo "  v /run/$SERVICE.env written"
-else
-  echo "  ! /run/$SERVICE.env not written yet (daemon may still be starting)"
+# The file was deleted before the restart, so its reappearance means this
+# process wrote it. The daemon writes once at startup and again on the first
+# real state change, and on a Pi wifi can take ~10s to associate, so wait
+# rather than checking once.
+echo "=== Waiting for $ENV_FILE (up to ${ENV_FILE_TIMEOUT}s) ==="
+for i in $(seq "$ENV_FILE_TIMEOUT"); do
+  if ssh "$REMOTE" "test -s $ENV_FILE"; then
+    echo "  v $ENV_FILE written by the new process after ${i}s"
+    ssh "$REMOTE" "cat $ENV_FILE" | sed 's/^/    /'
+    ENV_FILE_OK=1
+    break
+  fi
+  sleep 1
+done
+
+if [ -z "${ENV_FILE_OK:-}" ]; then
+  echo "  x $ENV_FILE not written within ${ENV_FILE_TIMEOUT}s" >&2
+  ssh "$REMOTE" "sudo journalctl -u $SERVICE -n 20 --no-pager"
+  exit 1
 fi
 
 echo "=== Cleaning old versions (keeping $KEEP_VERSIONS) ==="

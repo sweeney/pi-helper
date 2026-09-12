@@ -56,6 +56,7 @@ type NetworkState struct {
     Gateway    string
     WifiStatus string // "connected", "disconnected", "no-hardware"
     WifiSSID   string
+    Host       string // system hostname
 }
 
 type NetworkMonitor interface {
@@ -80,6 +81,7 @@ type EnvWriter interface {
 - Determines primary interface by: has default route > has IP > link up
 - Wifi detection via interface name (wlan*) and wireless extensions
 - SSID detection via `wpa_cli` or `iwgetid`
+- Hostname via `os.Hostname` (portable across all build targets, unlike netlink)
 
 ### 2. Env Writer
 - Atomic writes: write to temp file, chmod 0644, then rename
@@ -99,7 +101,13 @@ NETWORK_IP=192.168.x.x
 NETWORK_GATEWAY=192.168.x.1
 NETWORK_WIFI_STATUS=connected|disconnected|no-hardware
 NETWORK_WIFI_SSID=MyNetwork
+NETWORK_HOST=piz2c
 ```
+
+All keys are always written; an unknown value is an empty string, never an
+omitted line. `NETWORK_HOST` comes from `os.Hostname` on every poll and is
+validated against the RFC 1123 character set first, so a hostname that would
+break a consumer running `source` on the file is published as empty instead.
 
 ## Configuration
 - **Module path**: `github.com/sweeney/pi-helper`
@@ -192,7 +200,9 @@ Flags:
 > once on the Pi to install to `/opt/pi-helper/bin` and enable the service, then
 > `make deploy HOST=user@host` from the repo. `deploy/deploy.sh` auto-detects the
 > target architecture, ships a versioned binary, swaps the active symlink, restarts,
-> and verifies the running version.
+> and verifies the running version. The env file is removed before the restart so
+the post-deploy check proves the new process wrote it rather than passing on the
+previous process's file (`/run` is tmpfs and survives a service restart).
 
 ## Implementation Order
 
@@ -211,6 +221,6 @@ Flags:
 2. `make build-pi-zero` produces ARM binary
 3. Manual test on actual Pi:
    - scp binary to Pi
-   - Run manually, check `/run/pi-helper.env` contents
+   - Run manually, check `/run/pi-helper.env` contents (including `NETWORK_HOST`)
    - Install service, verify starts on boot
    - Disconnect/reconnect wifi, verify env updates

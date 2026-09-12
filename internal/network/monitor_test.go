@@ -1,8 +1,13 @@
 package network
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"io"
+	"log"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -565,5 +570,157 @@ func TestMonitor_State_Connecting(t *testing.T) {
 	state := m.State()
 	if state.Status != StatusConnecting {
 		t.Errorf("State().Status = %q, want %q", state.Status, StatusConnecting)
+	}
+}
+
+func TestMonitor_State_Host(t *testing.T) {
+	tests := []struct {
+		name     string
+		hostname string
+		err      error
+		want     string
+	}{
+		{"plain", "foobar", nil, "foobar"},
+		{"trims whitespace", "foobar\n", nil, "foobar"},
+		{"fqdn kept", "piz2c.local", nil, "piz2c.local"},
+		{"kernel placeholder", "(none)", nil, ""},
+		{"empty", "", nil, ""},
+		{"whitespace only", "   ", nil, ""},
+		{"lookup error", "", errors.New("no hostname"), ""},
+		{"shell metacharacters", "foo;rm -rf /", nil, ""},
+		{"embedded newline", "foo\nBAR=baz", nil, ""},
+		{"quotes", `foo"bar`, nil, ""},
+		{"spaces", "my host", nil, ""},
+		{"too long", strings.Repeat("a", 254), nil, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := NewMockNetlinkProvider()
+			mock.links = []LinkInfo{
+				{Name: "lo", Index: 1, Up: true, Running: true},
+				{Name: "eth0", Index: 2, Up: true, Running: true},
+			}
+			mock.addrs = map[int][]AddrInfo{
+				2: {{LinkIndex: 2, IP: net.ParseIP("192.168.1.50"), Mask: net.CIDRMask(24, 32)}},
+			}
+			mock.routes = []RouteInfo{
+				{LinkIndex: 2, Dst: nil, Gateway: net.ParseIP("192.168.1.1")},
+			}
+
+			m := NewMonitor(
+				WithNetlinkProvider(mock),
+				WithPollInterval(time.Hour),
+				WithLogger(log.New(io.Discard, "", 0)),
+				WithHostnameFunc(func() (string, error) { return tt.hostname, tt.err }),
+			)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			if err := m.Start(ctx); err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			defer m.Stop()
+
+			if got := m.State().Host; got != tt.want {
+				t.Errorf("State().Host = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// A rejected hostname must not take the rest of the state down with it.
+func TestMonitor_State_HostFailureKeepsNetworkState(t *testing.T) {
+	mock := NewMockNetlinkProvider()
+	mock.links = []LinkInfo{
+		{Name: "lo", Index: 1, Up: true, Running: true},
+		{Name: "eth0", Index: 2, Up: true, Running: true},
+	}
+	mock.addrs = map[int][]AddrInfo{
+		2: {{LinkIndex: 2, IP: net.ParseIP("192.168.1.50"), Mask: net.CIDRMask(24, 32)}},
+	}
+	mock.routes = []RouteInfo{
+		{LinkIndex: 2, Dst: nil, Gateway: net.ParseIP("192.168.1.1")},
+	}
+
+	m := NewMonitor(
+		WithNetlinkProvider(mock),
+		WithPollInterval(time.Hour),
+		WithLogger(log.New(io.Discard, "", 0)),
+		WithHostnameFunc(func() (string, error) { return "", errors.New("boom") }),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := m.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer m.Stop()
+
+	state := m.State()
+	if state.Status != StatusConnected {
+		t.Errorf("State().Status = %q, want %q", state.Status, StatusConnected)
+	}
+	if state.IP != "192.168.1.50" {
+		t.Errorf("State().IP = %q, want %q", state.IP, "192.168.1.50")
+	}
+	if state.Host != "" {
+		t.Errorf("State().Host = %q, want empty", state.Host)
+	}
+}
+
+// A failing lookup logs once, not on every poll.
+func TestMonitor_Host_WarnsOnce(t *testing.T) {
+	mock := NewMockNetlinkProvider()
+	mock.links = []LinkInfo{{Name: "lo", Index: 1, Up: true, Running: true}}
+
+	var buf bytes.Buffer
+	m := NewMonitor(
+		WithNetlinkProvider(mock),
+		WithPollInterval(time.Hour),
+		WithLogger(log.New(&buf, "", 0)),
+		WithHostnameFunc(func() (string, error) { return "", errors.New("boom") }),
+	)
+
+	for i := 0; i < 5; i++ {
+		m.queryState()
+	}
+
+	if got := strings.Count(buf.String(), "failed to get hostname"); got != 1 {
+		t.Errorf("logged hostname failure %d times, want 1", got)
+	}
+}
+
+// Once the hostname comes back, a later failure is reported again.
+func TestMonitor_Host_WarnsAgainAfterRecovery(t *testing.T) {
+	mock := NewMockNetlinkProvider()
+	mock.links = []LinkInfo{{Name: "lo", Index: 1, Up: true, Running: true}}
+
+	var buf bytes.Buffer
+	fail := true
+	m := NewMonitor(
+		WithNetlinkProvider(mock),
+		WithPollInterval(time.Hour),
+		WithLogger(log.New(&buf, "", 0)),
+		WithHostnameFunc(func() (string, error) {
+			if fail {
+				return "", errors.New("boom")
+			}
+			return "foobar", nil
+		}),
+	)
+
+	m.queryState() // fails, logs
+	fail = false
+	if got := m.queryState().Host; got != "foobar" { // recovers, clears the latch
+		t.Fatalf("Host = %q, want %q", got, "foobar")
+	}
+	fail = true
+	m.queryState() // fails again, logs again
+
+	if got := strings.Count(buf.String(), "failed to get hostname"); got != 2 {
+		t.Errorf("logged hostname failure %d times, want 2", got)
 	}
 }

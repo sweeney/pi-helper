@@ -7,8 +7,16 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// HostnameFunc returns the system hostname.
+type HostnameFunc func() (string, error)
+
+// hostnameNone is the placeholder the Linux kernel reports when no hostname
+// has been set (e.g. before DHCP or systemd-hostnamed has run).
+const hostnameNone = "(none)"
 
 // Monitor watches network state and notifies subscribers of changes.
 type Monitor struct {
@@ -16,6 +24,12 @@ type Monitor struct {
 	pollInterval time.Duration
 	verbose      bool
 	logger       *log.Logger
+	hostname     HostnameFunc
+
+	// hostnameWarned ensures a failing hostname lookup is logged once rather
+	// than on every poll. queryState runs from both the netlink and poll
+	// goroutines, so this must be atomic.
+	hostnameWarned atomic.Bool
 
 	mu          sync.RWMutex
 	state       State
@@ -49,6 +63,13 @@ func WithNetlinkProvider(p NetlinkProvider) MonitorOption {
 	}
 }
 
+// WithHostnameFunc sets a custom hostname lookup (for testing).
+func WithHostnameFunc(f HostnameFunc) MonitorOption {
+	return func(m *Monitor) {
+		m.hostname = f
+	}
+}
+
 // WithLogger sets a custom logger.
 func WithLogger(l *log.Logger) MonitorOption {
 	return func(m *Monitor) {
@@ -64,6 +85,7 @@ func NewMonitor(opts ...MonitorOption) *Monitor {
 		state:        NewState(),
 		done:         make(chan struct{}),
 		logger:       log.New(os.Stderr, "[network] ", log.LstdFlags),
+		hostname:     os.Hostname,
 	}
 
 	for _, opt := range opts {
@@ -223,6 +245,7 @@ func (m *Monitor) poll() {
 // queryState queries the current network state from the system.
 func (m *Monitor) queryState() State {
 	state := NewState()
+	state.Host = m.getHostname()
 
 	// Check for wifi hardware
 	hasWifi := m.detectWifiHardware()
@@ -337,6 +360,59 @@ func (m *Monitor) queryState() State {
 	}
 
 	return state
+}
+
+// getHostname returns the system hostname, or "" if it cannot be determined
+// or is not usable as an env var value.
+//
+// The lookup itself is os.Hostname, which is a plain syscall wrapper available
+// on every platform Go builds for, so this needs no per-arch handling the way
+// netlink does. What does vary is what the system reports: an unconfigured Pi
+// returns "(none)" or an empty string, and the value ends up in a file that
+// other services source as shell, so it is validated before being published.
+func (m *Monitor) getHostname() string {
+	host, err := m.hostname()
+	if err != nil {
+		// Log once: this polls every 30s and a broken lookup stays broken.
+		if !m.hostnameWarned.Swap(true) {
+			m.logger.Printf("failed to get hostname: %v (NETWORK_HOST will be empty)", err)
+		}
+		return ""
+	}
+
+	host = strings.TrimSpace(host)
+	if host == "" || host == hostnameNone {
+		return ""
+	}
+
+	if !isValidHostname(host) {
+		if !m.hostnameWarned.Swap(true) {
+			m.logger.Printf("hostname %q contains unexpected characters, NETWORK_HOST will be empty", host)
+		}
+		return ""
+	}
+
+	m.hostnameWarned.Store(false)
+	return host
+}
+
+// isValidHostname reports whether host is safe to publish as an env var value.
+// It accepts the RFC 1123 character set (letters, digits, hyphen, dot), which
+// excludes everything that would break a consumer running `source` on the env
+// file: whitespace, quotes, newlines, and shell metacharacters.
+func isValidHostname(host string) bool {
+	if len(host) > 253 {
+		return false
+	}
+	for _, r := range host {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-', r == '.':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // detectWifiHardware checks if wifi hardware is present.
