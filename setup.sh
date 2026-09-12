@@ -43,8 +43,18 @@ chown "$DEPLOY_USER:$DEPLOY_USER" /opt/$SERVICE/bin
 chmod 755 /opt/$SERVICE/bin
 
 echo "=== Installing systemd unit ==="
-cp "$UNIT_FILE" /etc/systemd/system/$SERVICE.service
-chmod 644 /etc/systemd/system/$SERVICE.service
+INSTALLED_UNIT="/etc/systemd/system/$SERVICE.service"
+# An earlier generation of this script symlinked the unit out of the deploy
+# user's home directory. A plain cp follows that symlink and writes through it,
+# which leaves the live unit file outside /etc and breaks the service the
+# moment that directory is cleaned up. --remove-destination replaces the
+# symlink itself.
+if [ -L "$INSTALLED_UNIT" ]; then
+  echo "  ! replacing symlinked unit (was -> $(readlink "$INSTALLED_UNIT"))"
+fi
+cp --remove-destination "$UNIT_FILE" "$INSTALLED_UNIT"
+chown root:root "$INSTALLED_UNIT"
+chmod 644 "$INSTALLED_UNIT"
 
 echo "=== Configuring sudoers ==="
 cat > /etc/sudoers.d/$SERVICE << EOF
